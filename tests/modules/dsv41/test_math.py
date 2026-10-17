@@ -50,6 +50,50 @@ def test_rotary_hand_example_and_4d_broadcast():
     assert torch.count_nonzero(out[..., :-4]) == 0
 
 
+def test_1017_wo_a_act_quant_is_fp8_roundtrip():
+    """kernel.py act_quant(..., scale_fmt='ue8m0', inplace=True) on the grouped wo_a input."""
+    math_mod = load_math()
+    torch.manual_seed(1)
+    grouped = torch.randn(1, 2, 2, 32)
+    assert torch.equal(math_mod.wo_a_act_quant(grouped, False), grouped)
+    got = math_mod.wo_a_act_quant(grouped, True)
+    # independent transcription of fast_round_scale + FP8 cast + dequant
+    xf = grouped.float().reshape(-1, 1, 32)
+    amax = xf.abs().amax(dim = -1).clamp_min(1e-4)
+    ratio = (amax / 448.0).clamp_min(2.0 ** -126)
+    bits = ratio.view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) - 127
+    man = bits & 0x7FFFFF
+    scale = torch.exp2(exp + (man != 0).to(exp.dtype)).unsqueeze(-1)
+    expect = ((xf / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale)
+    expect = expect.reshape(grouped.shape).to(dtype = grouped.dtype)
+    assert torch.equal(got, expect)
+    assert not torch.allclose(got, grouped)
+
+
+def test_index_k_publish_follows_1017_when_group_is_open():
+    math_mod = load_math()
+    # owner, no new keys this step: 1017 still publishes its own cache; 0909 does not
+    assert math_mod.publish_index_k(True, False, True) is True
+    assert math_mod.publish_index_k(True, False, False) is False
+    assert math_mod.publish_index_k(True, True, False) is True
+    assert math_mod.publish_index_k(False, False, True) is False
+
+    # two KV sources. Previous token left layer 20 published. This token, layer 2's group is open.
+    published = "layer20"
+    own = {"layer2": "layer2-history"}
+    if math_mod.publish_index_k(True, False, True):
+        published_1017 = own["layer2"]
+    else:
+        published_1017 = published
+    if math_mod.publish_index_k(True, False, False):
+        published_0909 = own["layer2"]
+    else:
+        published_0909 = published
+    assert published_1017 == "layer2-history"
+    assert published_0909 == "layer20"
+
+
 def test_fp8_fp4_properties():
     math_mod = load_math()
     zeros = math_mod.fp8_fake_quant(torch.zeros(2, 32), 32)

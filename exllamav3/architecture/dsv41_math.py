@@ -35,7 +35,11 @@ def e8m0_scale(amax: torch.Tensor, fp_max: float) -> torch.Tensor:
 
 
 def fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    """Block FP8 E4M3 with E8M0 scales, dequantized back to ``x.dtype``. Last dim is the block axis."""
+    """Block FP8 E4M3 with E8M0 scales, dequantized back to ``x.dtype``. Last dim is the block axis.
+
+    This is the torch stand-in for ``kernel.py`` ``act_quant(..., scale_fmt="ue8m0", inplace=True)``:
+    amax clamped at 1e-4, power-of-two scale, FP8 round-trip. It is not bit-identical to TileLang.
+    """
     n = x.shape[-1]
     if n % block_size:
         return x
@@ -117,6 +121,26 @@ def apply_rotary_tail(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inver
         return x
     head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
     return torch.cat([head, apply_rotary(tail, freqs, inverse)], dim = -1)
+
+
+def publish_index_k(owns_k: bool, wrote_keys: bool, revision_1017: bool) -> bool:
+    """Whether this indexer replaces the shared index-key pointer.
+
+    1017 (``1bae0e10``) publishes the owner's own cache even when the compression group
+    did not complete, so a ratio-2 source keeps scoring its own keys. 0909 publishes
+    only on the step that appends keys and otherwise leaves the previous owner's cache
+    in place.
+    """
+    if not owns_k:
+        return False
+    return True if revision_1017 else wrote_keys
+
+
+def wo_a_act_quant(o: torch.Tensor, enabled: bool, block_size: int = 32) -> torch.Tensor:
+    """FP8 round-trip on the grouped ``wo_a`` input. 1017 enables it; 0909 leaves ``o`` alone."""
+    if not enabled:
+        return o
+    return fp8_fake_quant(o, block_size)
 
 
 def identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:

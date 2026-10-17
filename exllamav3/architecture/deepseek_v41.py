@@ -14,7 +14,7 @@ from ..modules.dsv41 import DSV41Collapse, DSV41State
 from .deepseek_v41_mtp import DeepseekV41MTPModel
 from .deepseek_v41_vision import DeepseekV41VisionModel
 from .dsv41_build import build_block
-from .dsv41_layout import passthrough_engram_keys
+from .dsv41_layout import passthrough_engram_keys, resolve_revision
 
 
 def _text(config: Config, expected, name: str, default = no_default):
@@ -165,6 +165,11 @@ class DeepseekV41Config(Config):
             self.model_classes["vision"] = DeepseekV41VisionModel
         else:
             self.vision = None
+
+        # 1017 vs 0909. Same config.json; the forward differs. See dsv41_layout.resolve_revision.
+        self.dsv41_revision = resolve_revision(directory, self.config_dict)
+        self.wo_a_act_quant = self.dsv41_revision == "1017"
+        self.publish_index_k_always = self.dsv41_revision == "1017"
 
 
 class DeepseekV41Model(Model):

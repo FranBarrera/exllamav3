@@ -7,7 +7,12 @@ tensor; conversion splits it into ``wo_a.slice.{g}`` EXL3 tensors.
 """
 from __future__ import annotations
 
+import os
 import re
+
+# Hugging Face commits. config.json does not record which one a directory is.
+REVISION_1017 = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+REVISION_0909 = "dba1be0a40aa45a94ad051997016db3960a90277"
 
 _LAYER = re.compile(r"layers\.\d+")
 _MTP = re.compile(r"mtp\.\d+")
@@ -168,6 +173,43 @@ def source_keys(cfg: dict, *, vision: bool = True, mtp: bool = True) -> set[str]
     if vision and p["vision_layers"]:
         _vision_keys(keys, p["vision_layers"])
     return keys
+
+
+def resolve_revision(directory: str, config_dict: dict | None = None) -> str:
+    """``"1017"`` or ``"0909"``.
+
+    An explicit ``dsv41_revision`` key wins (top level or ``text_config``). Otherwise the
+    checkpoint README, then the directory path. Official ``config.json`` files match, so a
+    bare directory with neither hint defaults to 1017, the forward this tree targets.
+    """
+    cfg = config_dict or {}
+    raw = cfg.get("dsv41_revision")
+    text = cfg.get("text_config")
+    if raw is None and isinstance(text, dict):
+        raw = text.get("dsv41_revision")
+    if raw is not None:
+        token = str(raw).strip().lower()
+        if token in {"1017", "1bae0e10", REVISION_1017}:
+            return "1017"
+        if token in {"0909", "dba1be0a", REVISION_0909}:
+            return "0909"
+        raise ValueError(
+            f"dsv41_revision must be 1017 or 0909, got {raw!r}"
+        )
+    readme = os.path.join(directory, "README.md")
+    if os.path.isfile(readme):
+        with open(readme, encoding = "utf-8", errors = "ignore") as handle:
+            head = handle.read(8000)
+        if "DeepSeek-V4.1-Flash-1017" in head or "1bae0e10" in head:
+            return "1017"
+        if "DeepSeek-V4.1-Flash" in head:
+            return "0909"
+    path = directory.replace("\\", "/").lower()
+    if "1017" in path or "1bae0e10" in path:
+        return "1017"
+    if "0909" in path or "dba1be0a" in path:
+        return "0909"
+    return "1017"
 
 
 def passthrough_engram_keys(cfg: dict) -> set[str]:

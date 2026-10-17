@@ -87,6 +87,12 @@ def flash_keys():
     attn = next(m for m in text if isinstance(m, DSV41Attention) and m.is_index_source)
     assert attn.q_priority == 4
     assert attn.idx_weights.qmap is None
+    # fixture directory has no README and no dsv41_revision, so the 1017 forward is the default
+    assert config.dsv41_revision == "1017"
+    assert attn.wo_a_act_quant is True
+    assert attn.publish_index_k_always is True
+    dspark_attn = next(m for m in mtp if isinstance(m, DSV41Attention))
+    assert dspark_attn.wo_a_act_quant is True
     engram = next(m for m in text if isinstance(m, DSV41Engram))
     assert engram.weights_numel() == engram.wkv.weights_numel()
     assert engram.weights_numel() == 24 * 256 * 5120 * 5
@@ -220,6 +226,65 @@ def test_tiny_strategy_skips_unquantized_tables():
     assert any(key.endswith("engram.wkv") for key in picked)
 
 
+def revision_0909():
+    import json
+    import os
+    import shutil
+    from exllamav3.architecture.deepseek_v41 import DeepseekV41Config
+    from exllamav3.model.model import Model
+    from exllamav3.modules.dsv41 import DSV41Attention
+
+    cfg = {
+        "architectures": ["DeepseekV41ForCausalLM"],
+        "dsv41_revision": "0909",
+        "vocab_size": 32,
+        "hidden_size": 32,
+        "moe_intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "qk_rope_head_dim": 8,
+        "q_lora_rank": 8,
+        "o_lora_rank": 8,
+        "o_groups": 2,
+        "rms_norm_eps": 1e-6,
+        "compress_ratios": [2],
+        "rope_theta": 10000.0,
+        "compress_rope_theta": 10000.0,
+        "n_routed_experts": 2,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 1,
+        "sliding_window": 4,
+        "kv_source_layer_ids": [0],
+        "index_source_layer_ids": [0],
+        "index_n_heads": 2,
+        "index_head_dim": 8,
+        "index_topk": 1,
+        "candidate_source_layer_id": 0,
+        "hc_mult": 2,
+        "engram_layer_ids": [],
+        "engram_num_embeddings": [],
+    }
+    dst = "/tmp/dsv41_rev_0909"
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst)
+    with open(os.path.join(dst, "config.json"), "w") as handle:
+        json.dump(cfg, handle)
+    config = DeepseekV41Config(dst)
+    model = Model.from_config(config)
+    attn = next(m for m in model if isinstance(m, DSV41Attention))
+    assert config.dsv41_revision == "0909"
+    assert attn.wo_a_act_quant is False
+    assert attn.publish_index_k_always is False
+    return config.dsv41_revision
+
+
 def test_v4_alias_does_not_load_v41_config():
     result = run_isolated(alias_rejected, env = _STUB, timeout = 300)
     assert result["hoist_ratio"] == 2
+
+
+def test_0909_revision_disables_wo_a_act_quant():
+    assert run_isolated(revision_0909, env = _STUB, timeout = 300) == "0909"

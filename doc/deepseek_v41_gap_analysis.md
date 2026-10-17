@@ -1,6 +1,21 @@
 # DeepSeek-V4.1-Flash gap analysis
 
-Checkpoint: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`architectures: ["DeepseekV41ForCausalLM"]`, `model_type: deepseek_v41`). Comparison is against this fork's `DeepseekV4ForCausalLM` and against the official MIT reference under `inference/` (`model.py`, `engram.py`, `kernel.py`, `vision.py`, `config.json`). Community EXL3 recipes were used only as a tensor-name compatibility target. Their code was not copied.
+Checkpoint: `deepseek-ai/DeepSeek-V4.1-Flash-1017` at revision **`1bae0e1088993b9b82de08f59de5be5a34e42170`** (`architectures: ["DeepseekV41ForCausalLM"]`, `model_type: deepseek_v41`). The September checkpoint is `deepseek-ai/DeepSeek-V4.1-Flash` at **`dba1be0a40aa45a94ad051997016db3960a90277`**. Comparison below is against this fork's `DeepseekV4ForCausalLM` and against those two official MIT trees (`inference/`, `encoding/`). Community EXL3 recipes were used only as a tensor-name compatibility target. Their code was not copied.
+
+## 1017 versus 0909
+
+`config.json`, `inference/config.json`, `tokenizer.json`, `model.safetensors.index.json` (96,085 tensors, 510,286,023,000 bytes), `inference/engram.py`, `inference/kernel.py`, `inference/vision.py`, `inference/convert.py`, `inference/generate.py`, and `inference/image_processor.py` are the same file at both revisions. Every one of the 48 weight shards has a new Git-LFS ETag and the same byte length. Shard 47 holds `layers.1.engram.embed.{weight,scale}` (101,535,150,936 bytes). Shard 48 holds `layers.14.engram.embed.{weight,scale}` (101,537,926,640 bytes). `gate.bias_vl` is not in those two shards: each trunk layer and each MTP block stores its own, so it arrives inside that layer's shard. Mixing a 0909 shard with a 1017 shard crosses checkpoint generations. Engram tables and every `gate.bias_vl` have to come from 1017.
+
+`inference/model.py` has two forward-pass edits. Nothing else in that file changed.
+
+1. `Attention.forward` and `DSparkAttention.forward` call `act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)` after the inverse RoPE and the view to `[batch, seq, groups, group_dim]`, before the grouped `wo_a` einsum. That is an in-place FP8 E4M3 round-trip with UE8M0 scales, block 32, on the per-group width. 0909 feeds the bf16/fp32 activations straight into `wo_a`.
+2. `Indexer.forward` publishes `shared_attn.index_k = self.k_cache` whenever the layer owns keys. 0909 published only inside `if owns_k and latent is not None`, so a ratio-2 source whose group was still open (decode steps where `(start_pos + 1) % 2 != 0` on layers 2, 8, and 14) left the pointer on the previous owner's cache, which at the start of a step is layer 20's cache from the previous token.
+
+Each KV source already had its own `k_cache` and `compress_kv_cache` in both revisions. The loader now keeps those caches under `ik.{layer}` and `ckv.{layer}` and publishes the shared pointer the way 1017 does. 0909 still publishes index keys only on the step that appends them.
+
+`encoding/encoding.py` also changed, and it is not a forward pass: tool-result content may be a block list, a user message that is only tool results does not start a new turn for `drop_thinking`, and image-token validation runs before tool messages are merged. This tree's chat helper is still the short `<|User|>` / `<|Assistant|>` prompt. It does not implement `encoding.py`.
+
+The two forwards are selected from the checkpoint because `config.json` cannot tell them apart. `dsv41_revision` (`"1017"` or `"0909"`, top level or under `text_config`) wins. Otherwise the loader reads `README.md`, then the directory path (`1017` / `1bae0e10` versus `0909` / `dba1be0a`). A directory with none of those defaults to 1017.
 
 ## Would an architecture alias be enough?
 
@@ -126,9 +141,10 @@ Published EXL3 name compatibility (the Mia vLLM TP=2 tree): `layers.N.attn.wo_a.
 
 ## What was verified here
 
-CPU, no CUDA. `EXLLAMA_EXT_STUB=1`. `pytest tests/modules/dsv41`: 18 passed.
+CPU, no CUDA. `EXLLAMA_EXT_STUB=1`. `pytest tests/modules/dsv41`: 22 passed.
 
-- Math against an independent transcription of the reference formulas: YaRN on/off, rotary (including the 4D broadcast), FP8/FP4 fake-quant properties, sparse attention, candidate-block pin, window and DSpark indices, Sinkhorn, Engram primes not reused across layers, hash multipliers and XOR order, compressed-token case collapse.
+- Math against an independent transcription of the reference formulas: YaRN on/off, rotary (including the 4D broadcast), FP8/FP4 fake-quant properties, the 1017 `wo_a` FP8 round-trip versus an identity 0909 input, the index-key publish rule, sparse attention, candidate-block pin, window and DSpark indices, Sinkhorn, Engram primes not reused across layers, hash multipliers and XOR order, compressed-token case collapse.
+- Revision selection: `dsv41_revision`, README title, and directory name. A bare directory defaults to 1017. A config pinned to 0909 builds attention with `wo_a_act_quant` and `publish_index_k_always` off, including on the DSpark attention of a 1017-default Flash tree (those flags stay on).
 - `source_keys` equals the Flash-1017 index patterns (96,085 names, 114 patterns), including 4 compressor `wkv`, 3 `wgate`, no `hc_head_fn`, no `tid2eid`.
 - Full Flash module tree (text + MTP + vision, sentinel weights) walks to the index except `.scale` sidecars. `wo_a` is 40 × 8 slices. An index-source attention has `q_priority == 4`. Engram `weights_numel` is `wkv` only.
 - Tiny flat config: quant strategy includes `wo_a.slice` and `engram.wkv`, and excludes `weights_proj`, `ffn.gate`, and `engram.embed`. Head bits stay 6.

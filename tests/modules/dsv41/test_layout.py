@@ -20,6 +20,27 @@ def load_layout():
     return module
 
 
+def test_revision_is_selected_by_config_readme_or_path(tmp_path):
+    layout = load_layout()
+    assert layout.REVISION_1017.startswith("1bae0e10")
+    assert layout.REVISION_0909.startswith("dba1be0a")
+    bare = tmp_path / "checkpoint"
+    bare.mkdir()
+    assert layout.resolve_revision(str(bare), {}) == "1017"
+    assert layout.resolve_revision(str(bare), {"dsv41_revision": "0909"}) == "0909"
+    assert layout.resolve_revision(str(bare), {"text_config": {"dsv41_revision": "1017"}}) == "1017"
+    readme = bare / "README.md"
+    readme.write_text("# DeepSeek-V4.1-Flash\n\nSeptember weights.\n")
+    assert layout.resolve_revision(str(bare), {}) == "0909"
+    readme.write_text("# DeepSeek-V4.1-Flash-1017\n\nrevision 1bae0e10\n")
+    assert layout.resolve_revision(str(bare), {}) == "1017"
+    # explicit key beats the README
+    assert layout.resolve_revision(str(bare), {"dsv41_revision": "0909"}) == "0909"
+    named = tmp_path / "DeepSeek-V4.1-Flash-0909"
+    named.mkdir()
+    assert layout.resolve_revision(str(named), {}) == "0909"
+
+
 def test_source_keys_match_index_patterns():
     layout = load_layout()
     cfg = json.load(open(os.path.join(_FIX, "deepseek_v41_flash_config.json")))

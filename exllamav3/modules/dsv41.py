@@ -355,6 +355,10 @@ class DSV41Attention(Module):
         self.uses_candidates = 0 <= candidate_source < layer_idx
         self.dspark = dspark
         self.rms_norm_eps = rms_norm_eps
+        # 1017 quantizes the grouped wo_a input and republishes an owner's index keys
+        # when the compression group is still open. 0909 does neither.
+        self.wo_a_act_quant = bool(getattr(config, "wo_a_act_quant", True))
+        self.publish_index_k_always = bool(getattr(config, "publish_index_k_always", True))
         self.q_priority = 2 + select_hq_bits
         self.extra_source_keys = (f"{key}.attn_sink",)
         self.attn_sink = None
@@ -529,6 +533,8 @@ class DSV41Attention(Module):
             if published is None:
                 return x.new_empty(batch, seqlen, 0, dtype = torch.int32)
             return published.to(dtype = torch.int32)
+        own_key = f"ik.{self.layer_idx}"
+        wrote = False
         if self.is_kv_source and latent is not None:
             if start == 0:
                 positions = torch.arange(latent.shape[1], device = x.device) * ratio
@@ -537,10 +543,18 @@ class DSV41Attention(Module):
             k = self.idx_k_norm.forward(self.idx_wk.forward(latent, params), params)
             k = M.apply_rotary_tail(k, self._freqs(positions), self.rope_dim)
             k = M.fp4_fake_quant(k, 32, "e8m0")
-            cache = runtime.get("index_k", x.device)
+            cache = runtime.get(own_key, x.device)
             dest = start // ratio
             cache = _grow(cache, batch, dest + k.shape[1], k.shape[-1], k, 0.0)
             cache[:, dest:dest + k.shape[1]] = k
+            runtime.put(own_key, cache)
+            wrote = True
+        # Each KV source keeps its own index keys. Publishing switches the shared pointer
+        # the later indexers read. 1017 switches even when this step appended nothing.
+        if M.publish_index_k(self.is_kv_source, wrote, self.publish_index_k_always):
+            need = max(end // ratio, 1)
+            cache = _grow(runtime.get(own_key, x.device), batch, need, self.index_head_dim, x, 0.0)
+            runtime.put(own_key, cache)
             runtime.put("index_k", cache)
         index_k = runtime.get("index_k", x.device)
         n_pos = end // ratio if ratio else 0
@@ -588,8 +602,16 @@ class DSV41Attention(Module):
         ratio = self.compress_ratio
         compress_len = (start + seqlen) // ratio
         latent = None
+        own_kv = f"ckv.{self.layer_idx}"
         if self.is_kv_source:
             latent = self._latent(x, params, runtime, start)
+            # Both revisions publish this layer's compressed cache before the write, so a
+            # group that is still open does not keep serving the previous source's KV.
+            own = _grow(
+                runtime.get(own_kv, x.device), batch, max(compress_len, 1), self.head_dim, x, 0.0,
+            )
+            runtime.put(own_kv, own)
+            runtime.put("compress_kv", own)
         idxs = self._index_body(
             x, qr, latent, start, offset, runtime,
             start + seqlen, ratio, batch, seqlen, params,
@@ -601,9 +623,10 @@ class DSV41Attention(Module):
                 positions = torch.tensor([start + 1 - ratio], device = x.device)
             latent = M.apply_rotary_tail(latent, self._freqs(positions), self.rope_dim)
             latent = M.fp4_fake_quant(latent, 16, "e4m3")
-            cache = _grow(runtime.get("compress_kv", x.device), batch, start // ratio + latent.shape[1], latent.shape[-1], latent, 0.0)
+            cache = _grow(runtime.get(own_kv, x.device), batch, start // ratio + latent.shape[1], latent.shape[-1], latent, 0.0)
             dest = start // ratio
             cache[:, dest:dest + latent.shape[1]] = latent
+            runtime.put(own_kv, cache)
             runtime.put("compress_kv", cache)
         cache = runtime.get("compress_kv", x.device)
         if cache is None or compress_len == 0:
@@ -615,7 +638,9 @@ class DSV41Attention(Module):
     def _project_out(self, o: torch.Tensor, params: dict) -> torch.Tensor:
         batch, seqlen, _, _ = o.shape
         o = o.view(batch, seqlen, self.o_groups, -1)
-        o = M.fp8_fake_quant(o, 32)
+        # 1017: act_quant (FP8 E4M3, UE8M0, block 32) on this grouped tensor, then wo_a.
+        # The block axis is the per-group width, matching the reference view-then-quant.
+        o = M.wo_a_act_quant(o, self.wo_a_act_quant, 32)
         parts = [self.wo_a[g].forward(o[:, :, g].half(), params) for g in range(self.o_groups)]
         return self.wo_b.forward(torch.cat(parts, dim = -1), params)
 
