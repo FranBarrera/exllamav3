@@ -7,6 +7,7 @@ from ..loader.safetensors_alt import save_file
 from ..util.memory import free_mem
 from ..modules import Module, Linear
 from .quant_config import update_config, create_quantization_config_json
+from .stream_copy import append_extra, should_stream_copy, source_tensor_span, write_streamed_tensor
 
 def tsize(t):
     return t.nelement() * t.element_size()
@@ -95,13 +96,10 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         print(f" -- Skipping {skipped} source tensor(s) already covered by compiled modules")
     for key, data in extra_tensors.items():
         size = data["n_bytes"]
-        if size > max_shard_bytes:
+        if size > max_shard_bytes and not should_stream_copy(size):
             print(f" !! Warning, unable to fit tensor {key} in single shard of {args['shard_size']} MB")
-        if current_shard_size + size > max_shard_bytes and current_shard_size > 0:
-            current_shard_size = 0
-            out_map.append([])
-        current_shard_size += size
-        out_map[-1].append(key)
+        current_shard_size = append_extra(out_map, current_shard_size, key, size, max_shard_bytes)
+    out_map = [shard for shard in out_map if shard] or [[]]
 
     # Write model tensors. A tensor can be emitted by two walked modules when one module's key prefix covers
     # another's tensors (e.g. an MTP head's input projection and final norm named as sublayers of its first
@@ -116,6 +114,15 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             f"model-{file_idx+1:05}-of-{num_files:05}.safetensors"
         )
         print(f" -- Writing {filename}")
+        if len(modules) == 1 and isinstance(modules[0], tuple) and modules[0][0] == "stream":
+            key = modules[0][1]
+            src, offset, nbytes, dtype, shape = source_tensor_span(config.stc, key)
+            copied = write_streamed_tensor(
+                src, offset, nbytes, dtype, shape, os.path.join(out_dir, filename), key,
+            )
+            map_dict[key] = filename
+            total_size += copied
+            continue
         file_dict = {}
         for m in modules:
             if isinstance(m, Module):

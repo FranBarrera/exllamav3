@@ -1266,6 +1266,21 @@ def main(args, job_state):
                 [{} for _ in range(len(state))]
             )
         quant_preserves = [{} for _ in range(len(state))]
+        if (
+            job_state["next_module_idx"] > 0
+            and model.caps.get("checkpoint_quant_preserve")
+        ):
+            # Shared KV and the delayed mHC pre-mix live in this bag. An older checkpoint
+            # that never wrote the flag would resume with empty caches and quantize garbage.
+            if not job_state.get("quant_preserve_saved"):
+                raise RuntimeError(
+                    "This checkpoint has no quant_preserve bag. DeepSeek-V4.1 cannot resume "
+                    "a conversion that did not persist shared KV and mHC state. Start again."
+                )
+            preserve_path = os.path.join(args["work_dir"], "ckpt", "quant_preserve.safetensors")
+            if os.path.isfile(preserve_path):
+                from .quant_preserve import load_preserves
+                quant_preserves = load_preserves(preserve_path, len(state))
         # Rows whose hidden state (or unquantized reference) has gone non-finite are excluded
         # from all further capture, state advancement and error measurement. Persisted through
         # checkpoints; the job aborts if more than 10% of all rows break
@@ -1595,6 +1610,12 @@ def main(args, job_state):
             ckpt_dir_new = os.path.join(args["work_dir"], "ckpt_new")
             os.makedirs(ckpt_dir_new, exist_ok = True)
             job_state["bad_rows"] = sorted(bad_rows)
+            if use_reference_state and model.caps.get("checkpoint_quant_preserve"):
+                from .quant_preserve import save_preserves
+                preserve_path = os.path.join(ckpt_dir_new, "quant_preserve.safetensors")
+                if not save_preserves(quant_preserves, preserve_path) and os.path.isfile(preserve_path):
+                    os.remove(preserve_path)
+                job_state["quant_preserve_saved"] = True
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)

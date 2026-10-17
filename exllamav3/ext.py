@@ -27,7 +27,31 @@ def is_precompiled_extension_available():
         for suffix in importlib.machinery.EXTENSION_SUFFIXES
     )
 
-if is_precompiled_extension_available():
+class _ExtStub:
+    """Attribute stand-in used when EXLLAMA_EXT_STUB=1.
+
+    Graph construction reads kernel handles at import time (``ext.silu_mul`` and friends)
+    and only calls them on forward. Fetching an attribute succeeds; calling it does not.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(
+            f"exllamav3_ext.{self._name} is unavailable because EXLLAMA_EXT_STUB=1"
+        )
+
+    def __getattr__(self, item: str):
+        return _ExtStub(f"{self._name}.{item}")
+
+
+if os.environ.get("EXLLAMA_EXT_STUB") == "1":
+    import types
+    exllamav3_ext = types.ModuleType(extension_name)
+    exllamav3_ext.__getattr__ = lambda name: _ExtStub(name)  # type: ignore[method-assign]
+    sys.modules[extension_name] = exllamav3_ext
+elif is_precompiled_extension_available():
     import exllamav3_ext
 else:
 
